@@ -277,12 +277,14 @@ export function LandingPage({ isLoggedIn }: LandingPageProps) {
 
           <div data-hero-copy className="relative mx-auto mt-20 w-full max-w-[1200px]">
             <div className="relative aspect-[16/9] w-full overflow-hidden border border-border bg-card shadow-2xl rounded-lg">
-              <Image
-                src="/landing/deep-dive-dashboard-2.webp"
-                alt="Product Interface Preview"
-                fill
-                className="object-cover"
-                priority
+              <video
+                src="/landing/hero-flow.mp4"
+                poster="/landing/deep-dive-dashboard-2.webp"
+                autoPlay
+                loop
+                muted
+                playsInline
+                className="absolute inset-0 h-full w-full object-cover"
               />
               <div className="absolute inset-0 bg-gradient-to-t from-background/90 via-transparent to-transparent pointer-events-none" />
 
