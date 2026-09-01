@@ -22,7 +22,7 @@ import {
   isValidEmailAddress,
   normalizeEmail,
 } from '@/lib/email-validation';
-import { startCardlessTrial } from '@/lib/billing';
+import { startCardlessTrialOnSignup } from '@/lib/billing';
 import { recordSignupCompleted } from '@/lib/analytics/signup';
 import { readRequestVisitor } from '@/lib/analytics/visitor';
 
@@ -166,7 +166,7 @@ export async function POST(request: NextRequest) {
     // just lock the user out of an instance that has billing switched on.
     if (!emailVerificationRequired) {
       warnIfTrialsSkipVerification();
-      await startCardlessTrial(user.id);
+      await startCardlessTrialOnSignup(user.id);
     }
 
     // Send verification email if SMTP is configured

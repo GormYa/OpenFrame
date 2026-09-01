@@ -1,6 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import type Stripe from 'stripe';
-import { BillingSubscriptionStatus } from '@prisma/client';
+import { BillingSubscriptionStatus, InvitationStatus } from '@prisma/client';
 import { db } from '@/lib/db';
 import { getStripe, getStripePriceId } from '@/lib/stripe';
 import { isStripeFeatureEnabled } from '@/lib/feature-flags';
@@ -336,6 +336,12 @@ export function buildEffectiveBillingStatusWhereInput(
  * `billingTrialConsumedAt` is written here rather than only by the Stripe sync.
  * It is the once-per-account marker, so a re-issued verification link, a second
  * device or a replayed request all land on the `WHERE` clause and change nothing.
+ *
+ * Signup goes through `startCardlessTrialOnSignup` instead, which holds the trial
+ * back for an account that only exists because somebody invited it. This is the
+ * unconditional grant, reached later only when that account explicitly asks for
+ * its deferred trial through the start-trial endpoint. It is never started as a
+ * side effect of some other action; the clock costs the account its only trial.
  */
 export async function startCardlessTrial(userId: string, now: Date = new Date()) {
   // Without billing nothing is gated, so a trial would be a date nobody reads.
@@ -364,6 +370,69 @@ export async function startCardlessTrial(userId: string, now: Date = new Date())
   });
 
   return true;
+}
+
+/**
+ * Whether this account arrived as somebody else's collaborator.
+ *
+ * An invited member works inside the inviter's workspace on the inviter's
+ * billing, so a trial handed to them at signup buys them nothing and is spent
+ * before they have seen the product on an account of their own. Worse, it is
+ * spent for good: `billingTrialConsumedAt` is never cleared, so the day they
+ * consider becoming a customer themselves the trial is already gone.
+ *
+ * Two signals, because the invitation lands at different points on the two
+ * signup paths. The credentials route accepts the token inside the same request
+ * that creates the account, so by the time the trial is considered the
+ * membership row exists. An OAuth signup creates the account on the way out to
+ * the provider and accepts the invitation only on the way back, so there the
+ * pending invitation is the only thing to go on.
+ */
+async function arrivedAsCollaborator(userId: string, now: Date) {
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { email: true },
+  });
+
+  const [workspaceMemberships, projectMemberships, pendingInvitations] = await Promise.all([
+    db.workspaceMember.count({
+      where: { userId, workspace: { ownerId: { not: userId } } },
+    }),
+    db.projectMember.count({
+      where: { userId, project: { ownerId: { not: userId } } },
+    }),
+    user?.email
+      ? db.invitation.count({
+          where: {
+            email: user.email,
+            status: InvitationStatus.PENDING,
+            expiresAt: { gt: now },
+          },
+        })
+      : Promise.resolve(0),
+  ]);
+
+  return workspaceMemberships > 0 || projectMemberships > 0 || pendingInvitations > 0;
+}
+
+/**
+ * The trial as granted at signup: to everyone except an invited collaborator,
+ * whose clock is deferred until they own something of their own.
+ *
+ * Nothing is lost by waiting. The deferred trial stays claimable forever: the
+ * account starts it whenever it chooses through the start-trial endpoint, which
+ * the workspace-creation and billing screens point at.
+ */
+export async function startCardlessTrialOnSignup(userId: string, now: Date = new Date()) {
+  if (!isStripeFeatureEnabled()) {
+    return false;
+  }
+
+  if (await arrivedAsCollaborator(userId, now)) {
+    return false;
+  }
+
+  return startCardlessTrial(userId, now);
 }
 
 export async function getStripeCheckoutState(userId: string) {
@@ -439,6 +508,12 @@ export async function getWorkspaceCreationEligibility(userId: string) {
   const billingAccess = hasBillingAccess(user);
   const isPaid = isPaidTier(user);
   const collaborationCount = invitedWorkspaceCount + projectOnlyCollaborationCount;
+  // An invited collaborator whose trial was deferred at signup. Their trial is
+  // still owed, but starting it is their call, not a side effect of clicking
+  // "create workspace": the clock costs them their only trial, so it runs only
+  // after they ask for it through the explicit start-trial endpoint.
+  const canStartTrial =
+    isStripeFeatureEnabled() && !billingAccess && !user.trialEndsAt && !user.billingTrialConsumedAt;
 
   // A paying account creates as many workspaces as it wants. Everyone else gets
   // one, which covers both the cardless trial and the pre-trial state where an
@@ -452,9 +527,9 @@ export async function getWorkspaceCreationEligibility(userId: string) {
   if (!canCreateWorkspace && isStripeFeatureEnabled()) {
     if (billingAccess && ownedWorkspaceCount >= TRIAL_WORKSPACE_LIMIT) {
       reason = 'Your free trial includes one workspace. Subscribe to create more.';
-    } else if (collaborationCount > 0 && ownedWorkspaceCount === 0) {
+    } else if (canStartTrial && collaborationCount > 0 && ownedWorkspaceCount === 0) {
       reason =
-        'You are currently collaborating in someone else’s workspace or project. Start a subscription to create a workspace of your own.';
+        'You are collaborating in someone else’s workspace, so your free trial has not started yet. Start it to create a workspace of your own.';
     } else {
       reason = 'Your trial has ended. Start a subscription to create and keep owning workspaces.';
     }
@@ -462,6 +537,7 @@ export async function getWorkspaceCreationEligibility(userId: string) {
 
   return {
     canCreateWorkspace,
+    canStartTrial,
     reason,
     ownedWorkspaceCount,
     invitedWorkspaceCount,
@@ -493,6 +569,7 @@ export async function getBillingOverview(userId: string) {
   return {
     workspaceCreation: {
       canCreateWorkspace: billing.canCreateWorkspace,
+      canStartTrial: billing.canStartTrial,
       reason: billing.reason,
       ownedWorkspaceCount: billing.ownedWorkspaceCount,
       invitedWorkspaceCount: billing.invitedWorkspaceCount,
@@ -547,26 +624,65 @@ export async function getTrialNotice(
 
   const contentKeptUntil = getStorageCleanupEligibleAt(user);
 
-  if (hasActiveTrial(user.trialEndsAt, now) && user.trialEndsAt) {
-    const daysLeft = (user.trialEndsAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000);
-    if (daysLeft > TRIAL_ENDING_NOTICE_DAYS) {
+  const notice = ((): TrialNotice | null => {
+    if (hasActiveTrial(user.trialEndsAt, now) && user.trialEndsAt) {
+      const daysLeft = (user.trialEndsAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000);
+      if (daysLeft > TRIAL_ENDING_NOTICE_DAYS) {
+        return null;
+      }
+
+      return { kind: 'ending', endsAt: user.trialEndsAt, contentKeptUntil };
+    }
+
+    const endsAt = getBillingAccessEndDate(user);
+    if (!endsAt || hasBillingAccess(user, now)) {
       return null;
     }
 
-    return { kind: 'ending', endsAt: user.trialEndsAt, contentKeptUntil };
-  }
+    // Past the cleanup date there is nothing left to reassure anybody about.
+    if (contentKeptUntil && contentKeptUntil.getTime() <= now.getTime()) {
+      return null;
+    }
 
-  const endsAt = getBillingAccessEndDate(user);
-  if (!endsAt || hasBillingAccess(user, now)) {
+    return { kind: 'ended', endsAt, contentKeptUntil };
+  })();
+
+  // Neither sentence is true for a guest in somebody else's workspace: no
+  // deadline is coming for them, and the media the banner promises to keep is
+  // not theirs and is not at risk. They were reading "your projects and media
+  // are kept until" about a paying customer's work. Checked last so the queries
+  // only run for the few accounts a banner was about to be shown to.
+  if (notice && (await isCollaboratorWithNothingOfTheirOwn(userId, now))) {
     return null;
   }
 
-  // Past the cleanup date there is nothing left to reassure anybody about.
-  if (contentKeptUntil && contentKeptUntil.getTime() <= now.getTime()) {
-    return null;
-  }
+  return notice;
+}
 
-  return { kind: 'ended', endsAt, contentKeptUntil };
+/**
+ * Somebody who only ever works inside workspaces they do not own.
+ *
+ * Ownership is what makes billing personal: the storage, the projects and the
+ * cleanup deadline all hang off the owning account. An account that owns none of
+ * that, and reaches the product entirely through a workspace whose owner is
+ * paying, has nothing of its own on the line.
+ */
+async function isCollaboratorWithNothingOfTheirOwn(userId: string, now: Date) {
+  const [ownedWorkspaceCount, collaborationCount] = await Promise.all([
+    db.workspace.count({ where: { ownerId: userId } }),
+    db.workspace.count({
+      where: {
+        ownerId: { not: userId },
+        owner: buildBillingAccessWhereInput(now),
+        OR: [
+          { members: { some: { userId } } },
+          { projects: { some: { members: { some: { userId } } } } },
+        ],
+      },
+    }),
+  ]);
+
+  return ownedWorkspaceCount === 0 && collaborationCount > 0;
 }
 
 export async function getOrCreateStripeCustomerId(userId: string) {

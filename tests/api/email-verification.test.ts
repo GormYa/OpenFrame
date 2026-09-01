@@ -7,6 +7,7 @@
 // fails a test rather than a security review.
 
 import { createHash } from 'node:crypto';
+import { InvitationScope } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
 import nodemailer from 'nodemailer';
 import { db } from '@/lib/db';
@@ -20,7 +21,7 @@ import { GET as verifyEmail } from '@/app/api/auth/verify-email/route';
 import { POST as resendVerification } from '@/app/api/auth/verify-email/resend/route';
 import { apiRequest, callRoute, readData, readError } from '../helpers/request';
 import { mailTo, sentMail } from '../helpers/mail';
-import { createUser } from '../factories';
+import { addWorkspaceMember, createInvitation, createUser, seedProject } from '../factories';
 
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
@@ -115,6 +116,54 @@ describe('consumeVerificationToken', () => {
       (verified.trialEndsAt!.getTime() - verified.billingTrialConsumedAt!.getTime()) /
       (24 * 60 * 60 * 1000);
     expect(days).toBe(7);
+  });
+
+  // An invited collaborator works inside the inviter's workspace on the inviter's
+  // billing, so a trial handed over here would be spent before they had seen the
+  // product on an account of their own, and `billingTrialConsumedAt` is never
+  // cleared. It waits until they create a workspace of their own.
+  it('holds the trial back for somebody who verified as an invited member', async () => {
+    const host = await seedProject();
+    const user = await createUser({
+      email: 'ada@example.com',
+      emailVerified: null,
+      trialEndsAt: null,
+      billingTrialConsumedAt: null,
+    });
+    await addWorkspaceMember({ workspaceId: host.workspace.id, userId: user.id });
+    const token = await createVerificationToken('ada@example.com');
+
+    await consumeVerificationToken(token);
+
+    const verified = await db.user.findUniqueOrThrow({ where: { id: user.id } });
+    expect(verified.emailVerified).toBeInstanceOf(Date);
+    expect(verified.trialEndsAt).toBeNull();
+    expect(verified.billingTrialConsumedAt).toBeNull();
+  });
+
+  // The OAuth half of the same case: the account exists before the invitation is
+  // accepted, so the still-open invitation is the only signal there is.
+  it('holds the trial back while an invitation to that address is still open', async () => {
+    const host = await seedProject();
+    const user = await createUser({
+      email: 'ada@example.com',
+      emailVerified: null,
+      trialEndsAt: null,
+      billingTrialConsumedAt: null,
+    });
+    await createInvitation({
+      email: 'ada@example.com',
+      scope: InvitationScope.WORKSPACE,
+      workspaceId: host.workspace.id,
+      invitedById: host.owner.id,
+    });
+    const token = await createVerificationToken('ada@example.com');
+
+    await consumeVerificationToken(token);
+
+    const verified = await db.user.findUniqueOrThrow({ where: { id: user.id } });
+    expect(verified.trialEndsAt).toBeNull();
+    expect(verified.billingTrialConsumedAt).toBeNull();
   });
 
   it('does not hand a second trial to an account that already had one', async () => {
