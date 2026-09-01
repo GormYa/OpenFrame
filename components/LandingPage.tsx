@@ -10,7 +10,6 @@ import {
   Video,
   MoveRight,
   Play,
-  Mic,
   PenTool,
   Keyboard,
   BellRing,
@@ -277,28 +276,15 @@ export function LandingPage({ isLoggedIn }: LandingPageProps) {
 
           <div data-hero-copy className="relative mx-auto mt-20 w-full max-w-[1200px]">
             <div className="relative aspect-[16/9] w-full overflow-hidden border border-border bg-card shadow-2xl rounded-lg">
-              <Image
-                src="/landing/deep-dive-dashboard-2.webp"
-                alt="Product Interface Preview"
-                fill
-                className="object-cover"
-                priority
+              <video
+                src="/landing/hero-flow.mp4"
+                poster="/landing/deep-dive-dashboard-2.webp"
+                autoPlay
+                loop
+                muted
+                playsInline
+                className="absolute inset-0 h-full w-full object-cover"
               />
-              <div className="absolute inset-0 bg-gradient-to-t from-background/90 via-transparent to-transparent pointer-events-none" />
-
-              {/* Toolbar floating UI */}
-              <div className="absolute bottom-6 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 border border-border/80 bg-background/90 p-2 backdrop-blur-md shadow-xl">
-                <button className="flex h-8 w-8 items-center justify-center bg-primary text-primary-foreground hover:bg-primary/90">
-                  <PenTool className="h-4 w-4" />
-                </button>
-                <div className="h-6 w-px bg-border" />
-                <button className="flex h-8 w-8 items-center justify-center text-muted-foreground hover:bg-secondary hover:text-foreground">
-                  <MessageSquare className="h-4 w-4" />
-                </button>
-                <button className="flex h-8 w-8 items-center justify-center text-muted-foreground hover:bg-secondary hover:text-foreground">
-                  <Mic className="h-4 w-4" />
-                </button>
-              </div>
             </div>
           </div>
         </section>
