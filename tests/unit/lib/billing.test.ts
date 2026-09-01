@@ -15,6 +15,7 @@ import {
   getOrCreateStripeCustomerId,
   getStorageCleanupEligibleAt,
   getStripeCheckoutState,
+  getTrialNotice,
   getWorkspaceCreationEligibility,
   hasActiveSubscription,
   hasActiveTrial,
@@ -26,6 +27,7 @@ import {
   markSubscriptionCanceledByCustomerId,
   selectAuthoritativeSubscription,
   startCardlessTrial,
+  startCardlessTrialOnSignup,
   syncStripeCustomerSubscriptions,
   syncStripeSubscriptionToUser,
 } from '@/lib/billing';
@@ -35,6 +37,7 @@ const dbMock = vi.hoisted(() => ({
   workspace: { count: vi.fn() },
   workspaceMember: { count: vi.fn() },
   projectMember: { count: vi.fn() },
+  invitation: { count: vi.fn() },
   analyticsEvent: { createMany: vi.fn() },
 }));
 
@@ -818,6 +821,7 @@ describe('database backed billing helpers', () => {
     dbMock.workspace.count.mockReset();
     dbMock.workspaceMember.count.mockReset();
     dbMock.projectMember.count.mockReset();
+    dbMock.invitation.count.mockReset();
     stripeMock.customers.create.mockReset();
     stripeMock.subscriptions.list.mockReset();
     dbMock.user.update.mockImplementation(async (args: { data: unknown }) => args.data);
@@ -926,19 +930,188 @@ describe('database backed billing helpers', () => {
     });
   });
 
+  describe('startCardlessTrialOnSignup', () => {
+    function mockSignup(options: {
+      email?: string | null;
+      workspaceMemberships?: number;
+      projectMemberships?: number;
+      pendingInvitations?: number;
+    }) {
+      dbMock.user.findUnique.mockResolvedValue({
+        email: 'email' in options ? options.email : 'new@example.com',
+      });
+      dbMock.workspaceMember.count.mockResolvedValue(options.workspaceMemberships ?? 0);
+      dbMock.projectMember.count.mockResolvedValue(options.projectMemberships ?? 0);
+      dbMock.invitation.count.mockResolvedValue(options.pendingInvitations ?? 0);
+      dbMock.user.updateMany.mockResolvedValue({ count: 1 });
+    }
+
+    it('grants the trial to somebody who signed themselves up', async () => {
+      mockSignup({});
+
+      await expect(startCardlessTrialOnSignup('u1')).resolves.toBe(true);
+      expect(dbMock.user.updateMany).toHaveBeenCalled();
+    });
+
+    // The credentials route accepts the invitation in the same request that
+    // creates the account, so the membership is what gives the collaborator away.
+    it('holds the trial back for a member of somebody else workspace', async () => {
+      mockSignup({ workspaceMemberships: 1 });
+
+      await expect(startCardlessTrialOnSignup('u1')).resolves.toBe(false);
+      expect(dbMock.user.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('holds the trial back for a member of somebody else project', async () => {
+      mockSignup({ projectMemberships: 1 });
+
+      await expect(startCardlessTrialOnSignup('u1')).resolves.toBe(false);
+      expect(dbMock.user.updateMany).not.toHaveBeenCalled();
+    });
+
+    // An OAuth signup creates the account before the invitation is accepted, so
+    // there the still-pending invitation is the only signal available.
+    it('holds the trial back while an invitation to this address is pending', async () => {
+      mockSignup({ pendingInvitations: 1 });
+
+      await expect(startCardlessTrialOnSignup('u1')).resolves.toBe(false);
+      expect(dbMock.user.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('only counts invitations that are still open', async () => {
+      mockSignup({});
+
+      await startCardlessTrialOnSignup('u1');
+
+      expect(dbMock.invitation.count).toHaveBeenCalledWith({
+        where: {
+          email: 'new@example.com',
+          status: 'PENDING',
+          expiresAt: { gt: NOW },
+        },
+      });
+    });
+
+    it('does not look for invitations when the account has no address', async () => {
+      mockSignup({ email: null });
+
+      await expect(startCardlessTrialOnSignup('u1')).resolves.toBe(true);
+      expect(dbMock.invitation.count).not.toHaveBeenCalled();
+    });
+
+    it('grants nothing when billing is switched off entirely', async () => {
+      vi.stubEnv('OPENFRAME_ENABLE_STRIPE', 'false');
+      mockSignup({});
+
+      await expect(startCardlessTrialOnSignup('u1')).resolves.toBe(false);
+      expect(dbMock.user.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getTrialNotice', () => {
+    function mockNotice(options: {
+      trialEndsAt?: Date | null;
+      status?: BillingSubscriptionStatus;
+      billingAccessEndedAt?: Date | null;
+      ownedWorkspaces?: number;
+      collaborations?: number;
+    }) {
+      dbMock.user.findUnique.mockResolvedValue({
+        subscriptionStatus: options.status ?? BillingSubscriptionStatus.FREE,
+        trialEndsAt: options.trialEndsAt ?? null,
+        stripeCurrentPeriodEnd: null,
+        billingAccessEndedAt: options.billingAccessEndedAt ?? null,
+      });
+      dbMock.workspace.count
+        .mockResolvedValueOnce(options.ownedWorkspaces ?? 1)
+        .mockResolvedValueOnce(options.collaborations ?? 0);
+    }
+
+    it('says nothing while the trial still has more than the notice window left', async () => {
+      mockNotice({ trialEndsAt: new Date(NOW.getTime() + 5 * DAY_MS) });
+
+      await expect(getTrialNotice('u1')).resolves.toBeNull();
+    });
+
+    it('counts down once the trial is inside the notice window', async () => {
+      mockNotice({ trialEndsAt: new Date(NOW.getTime() + 2 * DAY_MS) });
+
+      const notice = await getTrialNotice('u1');
+
+      expect(notice?.kind).toBe('ending');
+    });
+
+    it('reports the trial as ended along with the date the media is kept until', async () => {
+      const endedAt = new Date(NOW.getTime() - 2 * DAY_MS);
+      mockNotice({ trialEndsAt: endedAt, billingAccessEndedAt: endedAt });
+
+      const notice = await getTrialNotice('u1');
+
+      expect(notice?.kind).toBe('ended');
+      expect(notice?.contentKeptUntil?.getTime()).toBe(endedAt.getTime() + 15 * DAY_MS);
+    });
+
+    // The banner is about this account's own deadline and its own media. A guest
+    // in a paying customer's workspace has neither, and was being told a paying
+    // customer's work would be deleted.
+    it('says nothing to a collaborator who owns no workspace of their own', async () => {
+      mockNotice({
+        trialEndsAt: new Date(NOW.getTime() + 2 * DAY_MS),
+        ownedWorkspaces: 0,
+        collaborations: 1,
+      });
+
+      await expect(getTrialNotice('u1')).resolves.toBeNull();
+    });
+
+    it('still warns a collaborator who also owns a workspace', async () => {
+      mockNotice({
+        trialEndsAt: new Date(NOW.getTime() + 2 * DAY_MS),
+        ownedWorkspaces: 1,
+        collaborations: 1,
+      });
+
+      expect((await getTrialNotice('u1'))?.kind).toBe('ending');
+    });
+
+    // A solo account that has not set anything up yet is not a collaborator, and
+    // its deadline is real.
+    it('still warns an account that owns nothing and collaborates nowhere', async () => {
+      mockNotice({
+        trialEndsAt: new Date(NOW.getTime() + 2 * DAY_MS),
+        ownedWorkspaces: 0,
+        collaborations: 0,
+      });
+
+      expect((await getTrialNotice('u1'))?.kind).toBe('ending');
+    });
+
+    it('leaves the ownership queries unrun when there is no notice to show', async () => {
+      mockNotice({ trialEndsAt: new Date(NOW.getTime() + 5 * DAY_MS) });
+
+      await getTrialNotice('u1');
+
+      expect(dbMock.workspace.count).not.toHaveBeenCalled();
+    });
+  });
+
   describe('getWorkspaceCreationEligibility', () => {
     function mockEligibility(options: {
       user?: Record<string, unknown> | null;
       owned?: number;
       invited?: number;
       projectOnly?: number;
+      /** Whether the once-per-account trial has already been spent and run out. */
+      consumed?: boolean;
     }) {
       dbMock.user.findUnique.mockResolvedValue(
         options.user === undefined
           ? {
               subscriptionStatus: BillingSubscriptionStatus.FREE,
               trialEndsAt: null,
-              billingTrialConsumedAt: null,
+              billingTrialConsumedAt: options.consumed
+                ? new Date(NOW.getTime() - 30 * DAY_MS)
+                : null,
               stripeCustomerId: null,
               stripeSubscriptionId: null,
               stripePriceId: null,
@@ -1045,7 +1218,7 @@ describe('database backed billing helpers', () => {
     });
 
     it('blocks an expired owner who already has a workspace', async () => {
-      mockEligibility({ owned: 1 });
+      mockEligibility({ owned: 1, consumed: true });
 
       const result = await getWorkspaceCreationEligibility('u1');
 
@@ -1053,27 +1226,41 @@ describe('database backed billing helpers', () => {
       expect(result.reason).toContain('Your trial has ended');
     });
 
-    it('blocks an expired user who only collaborates in someone else workspace', async () => {
+    // The deferred trial stays the collaborator's to spend, but never as a side
+    // effect: the workspace door stays shut until they explicitly start it, which
+    // is what `canStartTrial` tells the UI to offer.
+    it('blocks a collaborator whose trial is still unclaimed but offers to start it', async () => {
       mockEligibility({ owned: 0, invited: 1 });
 
       const result = await getWorkspaceCreationEligibility('u1');
 
       expect(result.canCreateWorkspace).toBe(false);
-      expect(result.reason).toContain('currently collaborating');
+      expect(result.canStartTrial).toBe(true);
+      expect(result.reason).toContain('Start it to create a workspace of your own');
     });
 
-    it('counts project-only collaboration towards the same block', async () => {
+    it('offers the same deferred trial to a project-only collaborator', async () => {
       mockEligibility({ owned: 0, projectOnly: 2 });
 
       const result = await getWorkspaceCreationEligibility('u1');
 
       expect(result.canCreateWorkspace).toBe(false);
-      expect(result.reason).toContain('currently collaborating');
+      expect(result.canStartTrial).toBe(true);
       expect(result.projectOnlyCollaborationCount).toBe(2);
     });
 
+    it('blocks a collaborator whose own trial has already run out', async () => {
+      mockEligibility({ owned: 0, invited: 1, consumed: true });
+
+      const result = await getWorkspaceCreationEligibility('u1');
+
+      expect(result.canCreateWorkspace).toBe(false);
+      expect(result.canStartTrial).toBe(false);
+      expect(result.reason).toContain('Your trial has ended');
+    });
+
     it('prefers the trial-ended reason when the user both owns and collaborates', async () => {
-      mockEligibility({ owned: 1, invited: 1 });
+      mockEligibility({ owned: 1, invited: 1, consumed: true });
 
       expect((await getWorkspaceCreationEligibility('u1')).reason).toContain(
         'Your trial has ended'
@@ -1136,6 +1323,7 @@ describe('database backed billing helpers', () => {
 
       expect(overview.workspaceCreation).toEqual({
         canCreateWorkspace: true,
+        canStartTrial: false,
         reason: null,
         ownedWorkspaceCount: 2,
         invitedWorkspaceCount: 1,

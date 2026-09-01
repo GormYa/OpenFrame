@@ -407,6 +407,53 @@ describe('POST /api/auth/register', () => {
     expect(created.billingTrialConsumedAt).toBeNull();
   });
 
+  // Registering through an invitation is the one case where the trial is held
+  // back even on an instance with no SMTP: the account is verified and created,
+  // but it joined somebody else's workspace and does not need a trial to work
+  // there. Creating a workspace of its own is what starts the clock.
+  it('grants no trial to an invited collaborator even without a verification step', async () => {
+    vi.stubEnv('SMTP_HOST', '');
+    vi.stubEnv('SMTP_USER', '');
+    vi.stubEnv('SMTP_PASSWORD', '');
+    const scenario = await seedProject();
+    const invitation = await createInvitation({
+      invitedById: scenario.owner.id,
+      scope: 'PROJECT',
+      projectId: scenario.project.id,
+      email: 'invited@example.com',
+      role: 'COMMENTATOR',
+    });
+    signedOut();
+
+    const response = await callRoute(
+      register,
+      registerRequest({
+        name: 'Invited Guest',
+        email: 'invited@example.com',
+        password: PASSWORD,
+        invitationToken: invitation.token,
+      })
+    );
+
+    expect(response.status).toBe(201);
+    const created = await db.user.findUniqueOrThrow({ where: { email: 'invited@example.com' } });
+    expect(created.emailVerified).toBeInstanceOf(Date);
+    expect(created.trialEndsAt).toBeNull();
+    expect(created.billingTrialConsumedAt).toBeNull();
+  });
+
+  it('starts the trial for somebody signing themselves up without SMTP', async () => {
+    vi.stubEnv('SMTP_HOST', '');
+    vi.stubEnv('SMTP_USER', '');
+    vi.stubEnv('SMTP_PASSWORD', '');
+
+    await post({ name: 'Self Hosted', email: 'solo@example.com', password: PASSWORD });
+
+    const created = await db.user.findUniqueOrThrow({ where: { email: 'solo@example.com' } });
+    expect(created.trialEndsAt).toBeInstanceOf(Date);
+    expect(created.billingTrialConsumedAt).toBeInstanceOf(Date);
+  });
+
   it('reports the rate limit budget on a successful registration', async () => {
     const response = await post({
       name: 'Rate Limited',

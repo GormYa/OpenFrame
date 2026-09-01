@@ -14,6 +14,7 @@ import {
   DELETE as removeWorkspaceMember,
   PATCH as patchWorkspaceMember,
 } from '@/app/api/workspaces/[workspaceId]/members/[memberId]/route';
+import { startCardlessTrial } from '@/lib/billing';
 import { apiRequest, callRoute, readData, readJson } from '../helpers/request';
 import { signedInAs, signedOut } from '../helpers/session';
 import {
@@ -178,6 +179,43 @@ describe('POST /api/workspaces', () => {
 
     expect(response.status).toBe(201);
     expect(await db.workspace.count()).toBe(1);
+  });
+
+  // An invited collaborator's trial is deferred, and nothing starts it as a side
+  // effect: the create is refused until they claim the trial explicitly.
+  it('refuses a workspace to a collaborator whose trial is still unclaimed', async () => {
+    const host = await seedProject();
+    const invited = await createUser({ trialEndsAt: null, billingTrialConsumedAt: null });
+    await addWorkspaceMember({ workspaceId: host.workspace.id, userId: invited.id });
+    signedInAs(invited);
+
+    const response = await callRoute(
+      createWorkspaceRoute,
+      apiRequest('/api/workspaces', { body: { name: 'My Own' } })
+    );
+
+    expect(response.status).toBe(403);
+    expect(await db.workspace.count({ where: { ownerId: invited.id } })).toBe(0);
+    const after = await db.user.findUniqueOrThrow({ where: { id: invited.id } });
+    expect(after.trialEndsAt).toBeNull();
+    expect(after.billingTrialConsumedAt).toBeNull();
+  });
+
+  it('lets that collaborator create a workspace once they start their trial', async () => {
+    const host = await seedProject();
+    const invited = await createUser({ trialEndsAt: null, billingTrialConsumedAt: null });
+    await addWorkspaceMember({ workspaceId: host.workspace.id, userId: invited.id });
+    signedInAs(invited);
+
+    await startCardlessTrial(invited.id);
+
+    const response = await callRoute(
+      createWorkspaceRoute,
+      apiRequest('/api/workspaces', { body: { name: 'My Own' } })
+    );
+
+    expect(response.status).toBe(201);
+    expect(await db.workspace.count({ where: { ownerId: invited.id } })).toBe(1);
   });
 
   it('refuses a second workspace for an expired user', async () => {

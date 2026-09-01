@@ -15,12 +15,35 @@ export default function NewWorkspacePage({
 }: {
   workspaceCreation: {
     canCreateWorkspace: boolean;
+    canStartTrial?: boolean;
     reason: string | null;
   };
 }) {
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
+  const [isStartingTrial, setIsStartingTrial] = useState(false);
   const [error, setError] = useState('');
+
+  const handleStartTrial = async () => {
+    setIsStartingTrial(true);
+    setError('');
+
+    try {
+      const response = await fetch('/api/billing/trial', { method: 'POST' });
+      const data = await response.json();
+
+      if (!response.ok) {
+        setError(data.error || 'Failed to start your free trial');
+        return;
+      }
+
+      router.refresh();
+    } catch {
+      setError('Something went wrong. Please try again.');
+    } finally {
+      setIsStartingTrial(false);
+    }
+  };
   const [formData, setFormData] = useState({
     name: '',
     description: '',
@@ -76,7 +99,11 @@ export default function NewWorkspacePage({
               )}
             </div>
             <CardTitle className="text-2xl">
-              {workspaceCreation.canCreateWorkspace ? 'Create New Workspace' : 'Upgrade Required'}
+              {workspaceCreation.canCreateWorkspace
+                ? 'Create New Workspace'
+                : workspaceCreation.canStartTrial
+                  ? 'Start Your Free Trial'
+                  : 'Upgrade Required'}
             </CardTitle>
             <CardDescription className="text-base">
               {workspaceCreation.canCreateWorkspace
@@ -139,9 +166,27 @@ export default function NewWorkspacePage({
                   You can still create and manage projects inside workspaces where you are already a
                   member.
                 </p>
-                <Button asChild className="w-full">
-                  <Link href="/settings">Open Billing Settings</Link>
-                </Button>
+                {error && (
+                  <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+                    {error}
+                  </div>
+                )}
+                {workspaceCreation.canStartTrial ? (
+                  <Button className="w-full" onClick={handleStartTrial} disabled={isStartingTrial}>
+                    {isStartingTrial ? (
+                      <>
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        Starting Trial...
+                      </>
+                    ) : (
+                      'Start Free Trial'
+                    )}
+                  </Button>
+                ) : (
+                  <Button asChild className="w-full">
+                    <Link href="/settings">Open Billing Settings</Link>
+                  </Button>
+                )}
               </div>
             )}
           </CardContent>

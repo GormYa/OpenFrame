@@ -6,7 +6,7 @@ import { PrismaAdapter } from '@auth/prisma-adapter';
 import bcrypt from 'bcryptjs';
 import { db } from '@/lib/db';
 import { ProjectMemberRole, WorkspaceMemberRole } from '@prisma/client';
-import { hasBillingAccess, startCardlessTrial } from '@/lib/billing';
+import { hasBillingAccess, startCardlessTrialOnSignup } from '@/lib/billing';
 import { isInviteCodeRequired } from '@/lib/feature-flags';
 import { isEmailVerificationEnabled } from '@/lib/email-verification';
 
@@ -171,7 +171,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       // opposite of what the signup page promised it. The address is already
       // proven here: the signIn callback above turns away an OAuth profile that
       // reports its email as unverified.
-      await startCardlessTrial(user.id);
+      await startCardlessTrialOnSignup(user.id);
     },
   },
 });

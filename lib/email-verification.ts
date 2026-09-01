@@ -11,7 +11,7 @@ import {
 import { logError } from '@/lib/logger';
 import { eventKey, recordEvent } from '@/lib/analytics/record';
 import { isProductAnalyticsEnabled, isStripeFeatureEnabled } from '@/lib/feature-flags';
-import { startCardlessTrial } from '@/lib/billing';
+import { startCardlessTrialOnSignup } from '@/lib/billing';
 
 // Reduce window to 2 hours — shorter exposure in access logs and backups.
 const TOKEN_EXPIRY_HOURS = 2;
@@ -120,7 +120,7 @@ export async function consumeVerificationToken(token: string): Promise<string | 
       });
     }
 
-    await startCardlessTrial(verified.id);
+    await startCardlessTrialOnSignup(verified.id);
   }
 
   return record.identifier;

@@ -67,6 +67,7 @@ interface BillingOverview {
   };
   workspaceCreation: {
     canCreateWorkspace: boolean;
+    canStartTrial?: boolean;
     reason: string | null;
     ownedWorkspaceCount: number;
     invitedWorkspaceCount: number;
@@ -147,7 +148,7 @@ export default function SettingsPage({ billingOnly = false }: { billingOnly?: bo
   const [testing, setTesting] = useState<string | null>(null);
   const [billing, setBilling] = useState<BillingOverview | null>(null);
   const [billingLoading, setBillingLoading] = useState(true);
-  const [billingAction, setBillingAction] = useState<'checkout' | 'portal' | null>(null);
+  const [billingAction, setBillingAction] = useState<'checkout' | 'portal' | 'trial' | null>(null);
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [storageLoading, setStorageLoading] = useState(true);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -277,6 +278,29 @@ export default function SettingsPage({ billingOnly = false }: { billingOnly?: bo
     },
     [showMessage]
   );
+
+  const handleStartTrial = useCallback(async () => {
+    setBillingAction('trial');
+    try {
+      const res = await fetch('/api/billing/trial', { method: 'POST' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        showMessage('error', data.error || 'Failed to start your free trial');
+        return;
+      }
+
+      const billingRes = await fetch('/api/billing');
+      if (billingRes.ok) {
+        setBilling((await billingRes.json()).data);
+      }
+      showMessage('success', 'Your free trial has started');
+    } catch {
+      showMessage('error', 'Failed to start your free trial');
+    } finally {
+      setBillingAction(null);
+    }
+  }, [showMessage]);
 
   if (loading) {
     return (
@@ -475,19 +499,34 @@ export default function SettingsPage({ billingOnly = false }: { billingOnly?: bo
                     )}
                   </Button>
                 ) : (
-                  <Button
-                    onClick={() => handleBillingRedirect('/api/billing/checkout')}
-                    disabled={!billing.checkoutAvailable || billingAction !== null}
-                  >
-                    {billingAction === 'checkout' ? (
-                      <>
-                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                        Redirecting...
-                      </>
-                    ) : (
-                      'Upgrade with Stripe'
-                    )}
-                  </Button>
+                  <>
+                    {billing.workspaceCreation.canStartTrial ? (
+                      <Button onClick={handleStartTrial} disabled={billingAction !== null}>
+                        {billingAction === 'trial' ? (
+                          <>
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                            Starting Trial...
+                          </>
+                        ) : (
+                          'Start Free Trial'
+                        )}
+                      </Button>
+                    ) : null}
+                    <Button
+                      variant={billing.workspaceCreation.canStartTrial ? 'outline' : 'default'}
+                      onClick={() => handleBillingRedirect('/api/billing/checkout')}
+                      disabled={!billing.checkoutAvailable || billingAction !== null}
+                    >
+                      {billingAction === 'checkout' ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          Redirecting...
+                        </>
+                      ) : (
+                        'Upgrade with Stripe'
+                      )}
+                    </Button>
+                  </>
                 )}
               </div>
             </>
