@@ -21,6 +21,9 @@ const eslintConfig = defineConfig([
     'test-results/**',
     'reports/**',
     '.stryker-tmp/**',
+    // Git worktrees checked out under .claude/worktrees are separate checkouts,
+    // not part of this tree; linting them fails the run on their files.
+    '.claude/**',
   ]),
   prettier,
   {
